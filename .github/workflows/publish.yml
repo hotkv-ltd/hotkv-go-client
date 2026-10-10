@@ -1,0 +1,109 @@
+name: Publish
+
+# A Go module is published by its git tag, so there is nothing to upload to a
+# registry. This workflow checks that the tag is releasable (the tag, the
+# Version constant and the go.mod module path agree, and the module builds,
+# vets and passes its unit tests) and then creates the GitHub release with
+# generated release notes.
+#
+#   - push of a tag v*: verify, then create the release
+#   - manual run (workflow_dispatch): verify, and create the release only when
+#     dry_run is unchecked; the tag is taken from the Version constant
+
+on:
+    push:
+        tags:
+            - "v*"
+    workflow_dispatch:
+        inputs:
+            dry_run:
+                description: "Dry run: verify only, do not create a release"
+                type: boolean
+                default: true
+
+permissions:
+    contents: write
+
+jobs:
+    publish:
+        name: Verify and publish
+        runs-on: ubuntu-latest
+        timeout-minutes: 30
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v6
+              with:
+                  fetch-depth: 0
+
+            - name: Set up Go
+              uses: actions/setup-go@v5
+              with:
+                  go-version: "1.23"
+
+            - name: Work out the tag and version
+              id: ver
+              run: |
+                  CONST=$(sed -n 's/^const Version = "\(.*\)"$/\1/p' hotkv.go)
+                  if [ -z "$CONST" ]; then
+                      echo "::error::could not read the Version constant from hotkv.go"
+                      exit 1
+                  fi
+                  if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+                      TAG="$GITHUB_REF_NAME"
+                  else
+                      TAG="v$CONST"
+                  fi
+                  VERSION="${TAG#v}"
+                  echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+                  echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+                  echo "const=$CONST" >> "$GITHUB_OUTPUT"
+
+            - name: Verify the tag, the Version constant and the module path agree
+              env:
+                  TAG: ${{ steps.ver.outputs.tag }}
+                  VERSION: ${{ steps.ver.outputs.version }}
+                  CONST: ${{ steps.ver.outputs.const }}
+              run: |
+                  if ! echo "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+                      echo "::error::tag '$TAG' is not a semantic version tag (vMAJOR.MINOR.PATCH)"
+                      exit 1
+                  fi
+                  if [ "$VERSION" != "$CONST" ]; then
+                      echo "::error::tag $TAG does not match the Version constant ($CONST) in hotkv.go"
+                      exit 1
+                  fi
+                  MAJOR="${VERSION%%.*}"
+                  MODULE=$(sed -n 's/^module //p' go.mod | tr -d '\r')
+                  EXPECTED="github.com/hotkv-ltd/hotkv-go-client"
+                  if [ "$MAJOR" -ge 2 ]; then EXPECTED="$EXPECTED/v$MAJOR"; fi
+                  if [ "$MODULE" != "$EXPECTED" ]; then
+                      echo "::error::go.mod module is '$MODULE', want '$EXPECTED' for $TAG"
+                      exit 1
+                  fi
+                  echo "tag $TAG, Version $CONST and module path agree"
+
+            - name: Build
+              run: go build ./...
+
+            - name: Vet
+              run: go vet ./...
+
+            - name: Test (unit; live tests skip without HOTKV_TEST_URL)
+              run: go test -count=1 -race ./...
+
+            - name: Create GitHub Release
+              if: ${{ github.event_name == 'push' || inputs.dry_run == false }}
+              uses: softprops/action-gh-release@v2
+              with:
+                  tag_name: ${{ steps.ver.outputs.tag }}
+                  name: ${{ steps.ver.outputs.tag }}
+                  generate_release_notes: true
+                  draft: false
+                  prerelease: ${{ contains(steps.ver.outputs.version, '-') }}
+
+            - name: Dry run summary
+              if: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+              env:
+                  TAG: ${{ steps.ver.outputs.tag }}
+              run: |
+                  echo "Dry run, $TAG is releasable; no release was created."
